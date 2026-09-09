@@ -65,8 +65,15 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "window_title": "WorkBuddy",
         "free_only": True,  # 只在限流重置后(免费额度)自动发送，绝不走积分通道
+        "balance_guard": True,  # 积分余额守卫：发送后余额减少立即停止并报警
     },
 }
+
+# 弹窗（置顶 MessageBox，比气泡通知更醒目，用于余额报警等紧急场景）
+def show_alert_popup(title: str, body: str):
+    import ctypes
+    # MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST = 0x30 | 0x10000 | 0x40000
+    ctypes.windll.user32.MessageBoxW(0, body, title, 0x30 | 0x10000 | 0x40000)
 
 
 def load_config() -> dict:
@@ -81,6 +88,15 @@ def load_config() -> dict:
     for k, v in DEFAULT_CONFIG.items():
         cfg.setdefault(k, v)
     return cfg
+
+
+def save_config(cfg: dict):
+    """原子写回配置文件"""
+    import os
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_FILE)
 
 
 def load_state() -> dict:
@@ -232,6 +248,8 @@ kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
 kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
 user32.SetClipboardData.restype = ctypes.c_void_p
 user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+user32.GetClipboardData.restype = ctypes.c_void_p
+user32.GetClipboardData.argtypes = (ctypes.c_uint,)
 
 
 def set_clipboard_text(text: str) -> bool:
@@ -302,7 +320,7 @@ def _get_clipboard_text() -> str:
         h = user32.GetClipboardData(13)  # CF_UNICODETEXT
         if not h:
             return ""
-        return ctypes.c_wchar_p(h).value or ""
+        return ctypes.cast(h, ctypes.c_wchar_p).value or ""
     finally:
         user32.CloseClipboard()
 
@@ -355,6 +373,12 @@ def send_task(task: dict, cfg: dict):
     else:
         auto = cfg.get("auto_send", {})
         if auto.get("enabled") and auto.get("free_only", True):
+            # 余额守卫：发送前读余额作为基线
+            balance_before = None
+            if auto.get("balance_guard", True):
+                balance_before = read_balance(cfg)
+                if balance_before is not None:
+                    log(f"发送前余额基线: {balance_before}")
             attempts = int(task.get("attempts", 0))
             ok, msg = auto_send_to_workbuddy(task["content"],
                                              auto.get("window_title", "WorkBuddy"))
@@ -375,6 +399,9 @@ def send_task(task: dict, cfg: dict):
             send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
                                       f"任务已恢复可发送：{task['content'][:80]}")
     task["status"] = "sent"
+    # 余额守卫：发送成功后校验余额是否减少，减少则报警并全局暂停
+    if auto.get("balance_guard", True) and balance_before is not None:
+        verify_no_credit_charge(cfg, balance_before, task["id"])
     # 重新读盘合并写回，减少与 UI/其他进程的丢更新窗口
     state = load_state()
     for t in state.get("tasks", []):
@@ -434,12 +461,95 @@ def balance_check(cfg: dict):
             req.add_header(k, v)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        bal = data.get(api.get("balance_field", "balance"))
-        usage = data.get(api.get("usage_field", "usage"))
+        bal = _to_number(data.get(api.get("balance_field", "balance")))
+        usage = _to_number(data.get(api.get("usage_field", "usage")))
         return bal, usage
     except Exception as e:
         log(f"余额查询失败: {e}")
         return None, None
+
+
+def _to_number(v):
+    """把各种类型的余额值安全转成 float，失败返回 None"""
+    if v is None:
+        return None
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def read_balance_clipboard():
+    """从剪贴板解析积分余额：复制 WorkBuddy 余额页面的数字即可。
+    返回 float 或 None"""
+    try:
+        if not user32.OpenClipboard(0):
+            return None
+        try:
+            h = user32.GetClipboardData(13)
+            text = ctypes.cast(h, ctypes.c_wchar_p).value if h else ""
+        finally:
+            user32.CloseClipboard()
+        if not text:
+            return None
+        # 匹配第一个数字（支持 "1,234.5" "剩余 1000 积分" 等）
+        m = re.search(r"-?\d[\d,]*(?:\.\d+)?", text)
+        return _to_number(m.group(0)) if m else None
+    except Exception:
+        return None
+
+
+def read_balance(cfg: dict):
+    """统一余额入口：优先 HTTP API，未配置 API 时回退剪贴板解析。
+    返回 float 或 None"""
+    bal, _ = balance_check(cfg)
+    if bal is not None:
+        return bal
+    return read_balance_clipboard()
+
+
+_BALANCE_STATE_KEY = "balance_guard"
+
+
+def balance_guard_paused(state: dict) -> bool:
+    """余额守卫是否已触发暂停"""
+    return bool(state.get(_BALANCE_STATE_KEY, {}).get("paused", False))
+
+
+def set_balance_guard_paused(state: dict, paused: bool, reason: str = ""):
+    """暂停/恢复自动发送（余额守卫触发时调用），写入磁盘"""
+    fresh = load_state()
+    g = fresh.setdefault(_BALANCE_STATE_KEY, {})
+    g["paused"] = paused
+    g["reason"] = reason
+    g["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_state(fresh)
+    if state is not None:
+        state[_BALANCE_STATE_KEY] = g
+
+
+def verify_no_credit_charge(cfg: dict, before: float, task_id) -> bool:
+    """发送后余额校验：余额减少 = 消耗了积分 → 暂停自动发送并弹窗报警。
+    返回 True=安全(余额未减少或无法读取)，False=已触发暂停。"""
+    if before is None:
+        return True  # 发送前没读到余额，无法判断（不误报）
+    after = read_balance(cfg)
+    if after is None:
+        log("余额守卫：发送后未能读取余额，跳过本次校验")
+        return True
+    if after < before - 1e-9:
+        reason = f"积分余额 {before} -> {after}"
+        log(f"⚠ 余额守卫触发: {reason}，任务 #{task_id}，暂停自动发送")
+        set_balance_guard_paused(None, True, reason)
+        show_alert_popup(
+            "⚠ 积分余额减少 - 自动发送已暂停",
+            f"检测到发送任务后积分余额减少：\n\n{reason}\n\n"
+            "自动发送已立即暂停以保护您的积分。\n"
+            "请检查 WorkBuddy 是否弹出了积分确认，\n"
+            "确认安全后可在监控界面重新启用。")
+        return False
+    log(f"余额校验通过: {before} -> {after}")
+    return True
 
 
 def run_loop(cfg: dict, once: bool = False):

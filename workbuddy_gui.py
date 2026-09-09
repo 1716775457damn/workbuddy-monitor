@@ -143,8 +143,12 @@ class App:
         self.btn_toggle.grid(row=0, column=0, padx=8, pady=6)
         self.lbl_mon = ttk.Label(bot, text="⏸ 未运行", foreground="red")
         self.lbl_mon.grid(row=0, column=1, padx=4)
-        ttk.Button(bot, text="💰 查看余额", command=self.on_balance).grid(row=0, column=3, padx=2)
-        ttk.Button(bot, text="使用说明", command=self.on_help).grid(row=0, column=4, padx=2)
+        self.lbl_guard = ttk.Label(bot, text="", foreground="red",
+                                   font=("Microsoft YaHei", 9, "bold"))
+        self.lbl_guard.grid(row=0, column=2, padx=4)
+        ttk.Button(bot, text="⚙ 设置", command=self.on_settings).grid(row=0, column=3, padx=2)
+        ttk.Button(bot, text="💰 查看余额", command=self.on_balance).grid(row=0, column=4, padx=2)
+        ttk.Button(bot, text="使用说明", command=self.on_help).grid(row=0, column=5, padx=2)
 
     # ========================================================= 模型选项
     def model_choices(self):
@@ -204,6 +208,10 @@ class App:
         try:
             self.state = core.load_state()
             self.refresh_all()
+            if core.balance_guard_paused(self.state):
+                self.lbl_guard.config(text="⛔ 余额守卫：自动发送已暂停", foreground="red")
+            else:
+                self.lbl_guard.config(text="", foreground="black")
         except Exception:
             pass
         self.root.after(2000, self._auto_sync)
@@ -350,6 +358,50 @@ class App:
         else:
             messagebox.showinfo("余额查询", f"余额: {bal}\n用量: {usage}")
 
+    def on_settings(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("设置")
+        dlg.geometry("420x240")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.columnconfigure(0, weight=1)
+
+        auto = self.cfg.get("auto_send", {})
+        v1 = tk.BooleanVar(value=auto.get("enabled", True))
+        v2 = tk.BooleanVar(value=auto.get("free_only", True))
+        v3 = tk.BooleanVar(value=auto.get("balance_guard", True))
+
+        ttk.Checkbutton(dlg, text="到点自动发送到 WorkBuddy 窗口",
+                        variable=v1).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 4))
+        ttk.Checkbutton(dlg, text="只用免费额度（限流重置后才发送）",
+                        variable=v2).grid(row=1, column=0, sticky="w", padx=14, pady=4)
+        ttk.Checkbutton(dlg, text="积分余额守卫（发送后余额减少立即停止+弹窗报警）",
+                        variable=v3).grid(row=2, column=0, sticky="w", padx=14, pady=4)
+
+        # 守卫暂停状态 + 恢复按钮
+        gs = ttk.LabelFrame(dlg, text="余额守卫状态")
+        gs.grid(row=3, column=0, sticky="ew", padx=14, pady=(10, 4))
+        gs.columnconfigure(0, weight=1)
+        paused = core.balance_guard_paused(self.state)
+        info = "⛔ 已暂停: " + core.load_state().get("balance_guard", {}).get("reason", "") \
+            if paused else "✅ 正常（未检测到积分消耗）"
+        lbl = ttk.Label(gs, text=info, foreground="red" if paused else "green", wraplength=380)
+        lbl.grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+        def resume():
+            core.set_balance_guard_paused(None, False, "")
+            lbl.config(text="✅ 正常（未检测到积分消耗）", foreground="green")
+
+        ttk.Button(gs, text="解除暂停（确认安全后）", command=resume).grid(row=1, column=0, pady=(0, 6))
+
+        def save():
+            self.cfg.setdefault("auto_send", {}).update({
+                "enabled": v1.get(), "free_only": v2.get(), "balance_guard": v3.get()})
+            core.save_config(self.cfg)
+            dlg.destroy()
+
+        ttk.Button(dlg, text="💾 保存", command=save).grid(row=4, column=0, pady=10)
+
     def on_help(self):
         messagebox.showinfo(
             "使用说明",
@@ -381,6 +433,10 @@ class App:
             try:
                 # 每轮从磁盘读最新状态，避免与 UI/CLI 写入冲突
                 state = core.load_state()
+                # 余额守卫暂停中：跳过自动发送，但仍更新限流检测
+                if core.balance_guard_paused(state):
+                    self._mon_stop.wait(interval)
+                    continue
                 core.check_rate_limits(state, self.cfg)
                 now = datetime.now()
                 rl = state.get("rate_limits", {})
