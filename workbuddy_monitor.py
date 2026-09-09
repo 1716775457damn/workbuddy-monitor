@@ -60,6 +60,12 @@ DEFAULT_CONFIG = {
     "poll_interval": 30,
     # Windows 通知标题
     "notify_title": "WorkBuddy 监控",
+    # 到点自动发送到 WorkBuddy 窗口（复制到剪贴板 + 粘贴 + 回车）
+    "auto_send": {
+        "enabled": True,
+        "window_title": "WorkBuddy",
+        "free_only": True,  # 只在限流重置后(免费额度)自动发送，绝不走积分通道
+    },
 }
 
 
@@ -167,6 +173,103 @@ def send_windows_notification(title: str, body: str):
         log(f"通知发送失败: {e}")
 
 
+# ---------------------------------------------------------------------------
+# 自动发送：剪贴板 + 激活 WorkBuddy 窗口 + Ctrl+V + Enter（纯 ctypes，无第三方依赖）
+# ---------------------------------------------------------------------------
+import ctypes
+import ctypes.wintypes as _wt
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+# 64 位下必须声明正确的返回/参数类型，否则句柄被截断导致写入违规
+kernel32.GlobalAlloc.restype = ctypes.c_void_p
+kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+user32.SetClipboardData.restype = ctypes.c_void_p
+user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+
+
+def set_clipboard_text(text: str) -> bool:
+    """把文本写入系统剪贴板（CF_UNICODETEXT）"""
+    if not user32.OpenClipboard(0):
+        return False
+    try:
+        user32.EmptyClipboard()
+        data = text.encode("utf-16-le") + b"\x00\x00"
+        h = kernel32.GlobalAlloc(0x2000, len(data))  # GMEM_MOVEABLE
+        if not h:
+            return False
+        ptr = kernel32.GlobalLock(h)
+        ctypes.memmove(ptr, data, len(data))
+        kernel32.GlobalUnlock(h)
+        if not user32.SetClipboardData(13, h):  # CF_UNICODETEXT
+            return False
+        return True
+    finally:
+        user32.CloseClipboard()
+
+
+def _find_window_by_title(substr: str):
+    """枚举顶层窗口，返回标题包含 substr 的第一个可见窗口句柄"""
+    result = []
+    @ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+    def cb(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            n = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if substr.lower() in buf.value.lower():
+                result.append(hwnd)
+        return True
+    user32.EnumWindows(cb, 0)
+    return result[0] if result else None
+
+
+def _activate_window(hwnd) -> bool:
+    """还原并前置窗口"""
+    if not hwnd:
+        return False
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.3)
+    return bool(user32.GetForegroundWindow() == hwnd)
+
+
+def _key(vk, up=False):
+    user32.keybd_event(vk, 0, 2 if up else 0, 0)
+
+
+def _ctrl_v():
+    _key(0x11); _key(0x56)
+    _key(0x56, True); _key(0x11, True)
+
+
+def _enter():
+    _key(0x0D)
+    _key(0x0D, True)
+
+
+def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy") -> tuple:
+    """复制到剪贴板 → 激活 WorkBuddy → 粘贴 → 回车发送。
+    返回 (ok, message)。免费额度保护：本函数只在限流重置后被调用，
+    且绝不会点击 WorkBuddy 中任何「消耗积分」确认弹窗。"""
+    if not set_clipboard_text(content):
+        return False, "写入剪贴板失败"
+    hwnd = _find_window_by_title(window_title)
+    if not hwnd:
+        return False, f"未找到标题含「{window_title}」的窗口"
+    if not _activate_window(hwnd):
+        return False, "无法激活 WorkBuddy 窗口"
+    time.sleep(0.5)
+    _ctrl_v()
+    time.sleep(1.0)  # 等输入框渲染完粘贴内容
+    _enter()
+    time.sleep(0.3)
+    return True, "已自动粘贴并发送到 WorkBuddy"
+
+
 def send_task(task: dict, cfg: dict):
     mode = cfg.get("send_mode", "notify")
     log(f"发送任务 #{task['id']}: {task['content'][:50]} (mode={mode})")
@@ -187,8 +290,17 @@ def send_task(task: dict, cfg: dict):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 log(f"API 响应: {resp.status}")
     else:
-        send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
-                                  f"任务已恢复可发送：{task['content'][:80]}")
+        auto = cfg.get("auto_send", {})
+        if auto.get("enabled") and auto.get("free_only", True):
+            ok, msg = auto_send_to_workbuddy(task["content"],
+                                             auto.get("window_title", "WorkBuddy"))
+            log(f"自动发送结果: {msg}")
+            if not ok:
+                send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
+                                          f"自动发送失败({msg})，内容已在剪贴板，请手动粘贴: {task['content'][:60]}")
+        else:
+            send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
+                                      f"任务已恢复可发送：{task['content'][:80]}")
     task["status"] = "sent"
     state = load_state()
     for t in state.get("tasks", []):
