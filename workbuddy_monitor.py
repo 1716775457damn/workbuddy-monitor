@@ -91,8 +91,12 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    """原子写入：先写临时文件再替换，防止写到一半崩溃损坏 state.json"""
+    import os
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 
 def log(msg: str):
@@ -251,10 +255,24 @@ def _enter():
     _key(0x0D, True)
 
 
+def _get_clipboard_text() -> str:
+    """读取当前剪贴板文本（用于发送后还原）"""
+    if not user32.OpenClipboard(0):
+        return ""
+    try:
+        h = user32.GetClipboardData(13)  # CF_UNICODETEXT
+        if not h:
+            return ""
+        return ctypes.c_wchar_p(h).value or ""
+    finally:
+        user32.CloseClipboard()
+
+
 def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy") -> tuple:
     """复制到剪贴板 → 激活 WorkBuddy → 粘贴 → 回车发送。
     返回 (ok, message)。免费额度保护：本函数只在限流重置后被调用，
     且绝不会点击 WorkBuddy 中任何「消耗积分」确认弹窗。"""
+    prev_clip = _get_clipboard_text()
     if not set_clipboard_text(content):
         return False, "写入剪贴板失败"
     hwnd = _find_window_by_title(window_title)
@@ -263,10 +281,16 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy") -> tup
     if not _activate_window(hwnd):
         return False, "无法激活 WorkBuddy 窗口"
     time.sleep(0.5)
+    # 发送前二次确认前台就是目标窗口，防止把内容打进无关应用
+    if user32.GetForegroundWindow() != hwnd:
+        return False, "前台窗口校验失败，取消发送"
     _ctrl_v()
     time.sleep(1.0)  # 等输入框渲染完粘贴内容
     _enter()
     time.sleep(0.3)
+    # 还原用户剪贴板
+    if prev_clip:
+        set_clipboard_text(prev_clip)
     return True, "已自动粘贴并发送到 WorkBuddy"
 
 
@@ -296,12 +320,15 @@ def send_task(task: dict, cfg: dict):
                                              auto.get("window_title", "WorkBuddy"))
             log(f"自动发送结果: {msg}")
             if not ok:
+                # 发送失败：保持 pending 状态，下轮重试；通知用户手动兜底
                 send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
-                                          f"自动发送失败({msg})，内容已在剪贴板，请手动粘贴: {task['content'][:60]}")
+                                          f"自动发送失败({msg})，内容已在剪贴板，请手动粘贴。任务保留在队列中将重试: {task['content'][:50]}")
+                return
         else:
             send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
                                       f"任务已恢复可发送：{task['content'][:80]}")
     task["status"] = "sent"
+    # 重新读盘合并写回，减少与 UI/其他进程的丢更新窗口
     state = load_state()
     for t in state.get("tasks", []):
         if t["id"] == task["id"]:
@@ -333,6 +360,11 @@ def check_rate_limits(state: dict, cfg: dict):
 
     model, reset, ok = parse_rate_limit_message(text)
     if ok:
+        # 陈旧记录防护：重置时间已过去超过 24 小时的消息是历史残留，
+        # 不写入限流记录，避免旧剪贴板内容触发"立即自动发送"
+        if reset and (datetime.now() - reset).total_seconds() > 86400:
+            log(f"忽略陈旧限流消息（重置时间 {reset} 已超过 24 小时）")
+            return
         key = model or "default"
         entry = state["rate_limits"].setdefault(key, {})
         entry["model"] = model or key

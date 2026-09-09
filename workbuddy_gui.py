@@ -374,7 +374,12 @@ class App:
                         reset_str = info.get("reset", "")
                         if not reset_str:
                             continue
-                        if now >= datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S"):
+                        try:
+                            reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            core.log(f"限流记录 {key} 的时间戳无效: {reset_str}，跳过")
+                            continue
+                        if now >= reset_dt:
                             model = info.get("model", key)
                             tasks = core.pending_tasks(state, model=model) or core.pending_tasks(state)
                             for t in tasks:
