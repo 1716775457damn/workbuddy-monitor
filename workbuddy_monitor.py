@@ -84,9 +84,23 @@ def load_config() -> dict:
 
 
 def load_state() -> dict:
+    """读取状态；文件损坏时自动备份到 state.json.bak 并回退空状态，保证程序可启动"""
     if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("state root is not a dict")
+            data.setdefault("tasks", [])
+            data.setdefault("rate_limits", {})
+            return data
+        except Exception as e:
+            import shutil
+            log(f"state.json 损坏({e})，已备份为 .bak 并重置")
+            try:
+                shutil.copy2(STATE_FILE, STATE_FILE.with_suffix(".bak"))
+            except Exception:
+                pass
     return {"tasks": [], "rate_limits": {}}
 
 
@@ -103,6 +117,10 @@ def log(msg: str):
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
     print(line)
     try:
+        # 日志轮转：超过 1MB 归档为 monitor.old.log，防止无限增长
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 1_000_000:
+            import shutil
+            shutil.move(str(LOG_FILE), str(LOG_FILE.with_suffix(".old.log")))
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -139,26 +157,47 @@ def parse_rate_limit_message(text: str):
 # 任务队列
 # ---------------------------------------------------------------------------
 def add_task(state: dict, content: str, model: str = ""):
+    """添加任务。注意：始终从磁盘读最新状态再合并写回，
+    避免用调用方内存里的旧状态覆盖磁盘上其他线程/进程的更改。"""
     task = {
         "id": int(time.time() * 1000),
         "content": content,
         "model": model,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "status": "pending",  # pending / sent
+        "status": "pending",  # pending / sent / failed
     }
-    state["tasks"].append(task)
-    save_state(state)
+    fresh = load_state()
+    fresh.setdefault("tasks", []).append(task)
+    save_state(fresh)
+    state["tasks"] = fresh["tasks"]  # 同步回调用方视图
     log(f"已添加任务 #{task['id']}: {content[:50]}")
     return task
 
 
+def update_task(task_id, **fields):
+    """按 id 更新单个任务字段：从磁盘读最新状态、合并、原子写回。
+    多线程/多进程安全的任务状态变更统一走这里。"""
+    fresh = load_state()
+    for t in fresh.get("tasks", []):
+        if t.get("id") == task_id:
+            t.update(fields)
+            save_state(fresh)
+            return True
+    return False
+
+
 def pending_tasks(state: dict, model: str = ""):
-    return [t for t in state["tasks"]
-            if t["status"] == "pending" and (not model or t.get("model") == model)]
+    return [t for t in state.get("tasks", [])
+            if t.get("status") == "pending" and (not model or t.get("model") == model)]
 
 # ---------------------------------------------------------------------------
 # 发送
 # ---------------------------------------------------------------------------
+def _ps_quote(s: str) -> str:
+    """转义 PowerShell 单引号字符串，防止任务内容中的引号破坏命令或注入"""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
 def send_windows_notification(title: str, body: str):
     try:
         ps = (
@@ -166,7 +205,7 @@ def send_windows_notification(title: str, body: str):
             "$n = New-Object System.Windows.Forms.NotifyIcon; "
             "$n.Icon = [System.Drawing.SystemIcons]::Information; "
             "$n.Visible = $true; "
-            f"$n.ShowBalloonTip(5000, '{title}', '{body}', "
+            f"$n.ShowBalloonTip(5000, {_ps_quote(title)}, {_ps_quote(body)}, "
             "[System.Windows.Forms.ToolTipIcon]::Info)"
         )
         subprocess.run(
@@ -316,11 +355,19 @@ def send_task(task: dict, cfg: dict):
     else:
         auto = cfg.get("auto_send", {})
         if auto.get("enabled") and auto.get("free_only", True):
+            attempts = int(task.get("attempts", 0))
             ok, msg = auto_send_to_workbuddy(task["content"],
                                              auto.get("window_title", "WorkBuddy"))
-            log(f"自动发送结果: {msg}")
+            log(f"自动发送结果(第{attempts+1}次): {msg}")
             if not ok:
-                # 发送失败：保持 pending 状态，下轮重试；通知用户手动兜底
+                attempts += 1
+                if attempts >= 3:
+                    # 重试上限：标记 failed，停止无限重试风暴
+                    update_task(task["id"], status="failed", attempts=attempts, last_error=msg)
+                    send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
+                                              f"自动发送连续{attempts}次失败，已停止重试。请在界面中查看/重新入队: {task['content'][:50]}")
+                    return
+                update_task(task["id"], attempts=attempts, last_error=msg)
                 send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
                                           f"自动发送失败({msg})，内容已在剪贴板，请手动粘贴。任务保留在队列中将重试: {task['content'][:50]}")
                 return
@@ -396,39 +443,53 @@ def balance_check(cfg: dict):
 
 
 def run_loop(cfg: dict, once: bool = False):
-    state = load_state()
     interval = max(5, int(cfg.get("poll_interval", 30)))
     log(f"开始监控 (interval={interval}s, mode={cfg.get('send_mode')})")
     while True:
-        check_rate_limits(state, cfg)
+        try:
+            # 每轮从磁盘读最新状态，避免长期持有旧视图覆盖别人的写入
+            state = load_state()
+            check_rate_limits(state, cfg)
 
-        now = datetime.now()
-        # 检查限流模型的重置时间，到点则发送该模型的待发任务
-        rl = state.get("rate_limits", {})
-        if not isinstance(rl, dict):
-            rl = {}
-            state["rate_limits"] = {}
-        for key, info in list(rl.items()):
-            reset_str = info.get("reset", "")
-            if not reset_str:
-                continue
-            reset = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
-            if now >= reset:
-                model = info.get("model", key)
-                tasks = pending_tasks(state, model=model)
-                if not tasks:
-                    tasks = pending_tasks(state)  # 无指定模型则发全部
-                for t in tasks:
-                    send_task(t, cfg)
-                if tasks:
-                    # 发完即清除限流记录
-                    state["rate_limits"].pop(key, None)
-                    save_state(state)
+            now = datetime.now()
+            # 检查限流模型的重置时间，到点则发送该模型的待发任务
+            rl = state.get("rate_limits", {})
+            if not isinstance(rl, dict):
+                rl = {}
+                state["rate_limits"] = {}
+            for key, info in list(rl.items()):
+                reset_str = info.get("reset", "")
+                if not reset_str:
+                    continue
+                try:
+                    reset = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    log(f"限流记录 {key} 的时间戳无效: {reset_str}，跳过")
+                    continue
+                if now >= reset:
+                    model = info.get("model", key)
+                    tasks = pending_tasks(state, model=model)
+                    if not tasks:
+                        # 免费额度保护：只发指定模型的任务，
+                        # 防止把别的模型(可能仍被限流，走积分)的任务误发
+                        tasks = []
+                    for t in tasks:
+                        send_task(t, cfg)
+                    if tasks:
+                        # 发完即清除限流记录
+                        state["rate_limits"].pop(key, None)
+                        save_state(state)
 
-        # 查询余额（可选）
-        bal, usage = balance_check(cfg)
-        if bal is not None:
-            log(f"余额={bal} 用量={usage}")
+            # 查询余额（可选）
+            bal, usage = balance_check(cfg)
+            if bal is not None:
+                log(f"余额={bal} 用量={usage}")
+        except KeyboardInterrupt:
+            log("用户中断，退出")
+            break
+        except Exception as e:
+            # 任何一轮的意外错误都不应杀死监控主循环
+            log(f"监控轮询异常(已跳过本轮): {e}")
 
         if once:
             break

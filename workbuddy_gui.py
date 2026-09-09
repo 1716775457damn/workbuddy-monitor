@@ -91,6 +91,7 @@ class App:
         self.tree.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns", pady=6)
         self.tree.tag_configure("sent", foreground="gray")
+        self.tree.tag_configure("failed", foreground="red")
         self.tree.tag_configure("pending", foreground="black")
         self.tree.bind("<Double-1>", lambda e: self.on_edit())
 
@@ -186,8 +187,11 @@ class App:
     def refresh_tasks(self):
         self.tree.delete(*self.tree.get_children())
         for t in self.state.get("tasks", []):
-            tag = "sent" if t["status"] == "sent" else "pending"
-            mark = "✅已发送" if t["status"] == "sent" else "⏳等待中"
+            st = t.get("status", "pending")
+            tag = {"sent": "sent", "failed": "failed"}.get(st, "pending")
+            mark = {"sent": "✅已发送", "failed": "❌发送失败"}.get(st, "⏳等待中")
+            if st == "failed" and t.get("last_error"):
+                mark += f" ({t['last_error'][:20]})"
             self.tree.insert("", "end", iid=str(t["id"]),
                              values=(t.get("model") or "-", t["content"], t.get("created", ""), mark),
                              tags=(tag,))
@@ -235,8 +239,16 @@ class App:
         task = self._selected_task()
         if not task:
             return
-        task["status"] = "pending"
-        self._save()
+        # 从磁盘最新状态合并写回，并清空失败计数，让自动发送可以再次尝试
+        fresh = core.load_state()
+        for t in fresh.get("tasks", []):
+            if t.get("id") == task["id"]:
+                t["status"] = "pending"
+                t["attempts"] = 0
+                t.pop("last_error", None)
+                break
+        core.save_state(fresh)
+        self.state = fresh
         self.refresh_tasks()
 
     def on_edit(self):
@@ -361,7 +373,10 @@ class App:
             self.lbl_mon.config(text="🟢 监控中…", foreground="green")
 
     def _monitor_loop(self):
-        interval = max(5, int(self.cfg.get("poll_interval", 30)))
+        try:
+            interval = max(5, int(float(self.cfg.get("poll_interval", 30))))
+        except (TypeError, ValueError):
+            interval = 30
         while not self._mon_stop.is_set():
             try:
                 # 每轮从磁盘读最新状态，避免与 UI/CLI 写入冲突
@@ -381,8 +396,14 @@ class App:
                             continue
                         if now >= reset_dt:
                             model = info.get("model", key)
-                            tasks = core.pending_tasks(state, model=model) or core.pending_tasks(state)
+                            # 免费额度保护：只发指定模型的任务，不回退到"发全部"
+                            tasks = core.pending_tasks(state, model=model)
                             for t in tasks:
+                                # 双重保险：发送前从磁盘确认仍是 pending（可能已被其他进程发送）
+                                fresh = core.load_state()
+                                still = next((x for x in fresh.get("tasks", []) if x.get("id") == t.get("id")), None)
+                                if not still or still.get("status") != "pending":
+                                    continue
                                 core.send_task(t, self.cfg)
                             if tasks:
                                 rl.pop(key, None)
