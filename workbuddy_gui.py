@@ -36,6 +36,7 @@ class App:
         self._build_ui()
         self.refresh_all()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(2000, self._auto_sync)
 
     # ================================================================ UI
     def _build_ui(self):
@@ -193,6 +194,15 @@ class App:
 
     def _save(self):
         core.save_state(self.state)
+
+    def _auto_sync(self):
+        """UI 主线程定时从磁盘同步状态，界面永远显示最新数据"""
+        try:
+            self.state = core.load_state()
+            self.refresh_all()
+        except Exception:
+            pass
+        self.root.after(2000, self._auto_sync)
 
     # ============================================================ 操作
     def on_add(self):
@@ -354,9 +364,11 @@ class App:
         interval = max(5, int(self.cfg.get("poll_interval", 30)))
         while not self._mon_stop.is_set():
             try:
-                core.check_rate_limits(self.state, self.cfg)
+                # 每轮从磁盘读最新状态，避免与 UI/CLI 写入冲突
+                state = core.load_state()
+                core.check_rate_limits(state, self.cfg)
                 now = datetime.now()
-                rl = self.state.get("rate_limits", {})
+                rl = state.get("rate_limits", {})
                 if isinstance(rl, dict):
                     for key, info in list(rl.items()):
                         reset_str = info.get("reset", "")
@@ -364,15 +376,14 @@ class App:
                             continue
                         if now >= datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S"):
                             model = info.get("model", key)
-                            tasks = core.pending_tasks(self.state, model=model) or core.pending_tasks(self.state)
+                            tasks = core.pending_tasks(state, model=model) or core.pending_tasks(state)
                             for t in tasks:
                                 core.send_task(t, self.cfg)
                             if tasks:
                                 rl.pop(key, None)
-                                self._save()
+                                core.save_state(state)
             except Exception as e:
                 core.log(f"监控线程错误: {e}")
-            self.root.after(0, self.refresh_all)
             self._mon_stop.wait(interval)
 
     def _on_close(self):
