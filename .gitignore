@@ -1,0 +1,6 @@
+# 用户私有数据，不上传
+config.json
+state.json
+monitor.log
+__pycache__/
+*.pyc

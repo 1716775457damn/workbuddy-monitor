@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+WorkBuddy 用量/余额监控 + 任务队列自动发送程序
+================================================
+功能：
+1. 监测 WorkBuddy 限流消息，自动解析模型名称和重置时间
+   （示例："当前您在Hy4 preview模型的使用量已超出频率限制，可在2026-09-09 19:30:24 重置可用。
+            您可切换其他模型或消耗积分继续使用该模型"）
+2. 任务列表：限流期间提交的任务进入队列，等待余额/额度恢复
+3. 到达重置时间后自动执行（发送）队列中的任务
+4. 可选：通过 HTTP API 查询余额/用量（在 config.json 中配置）
+
+用法：
+    python workbuddy_monitor.py            # 前台运行
+    python workbuddy_monitor.py --once     # 单次检查后退出（供计划任务调用）
+    python workbuddy_monitor.py --add "任务内容" --model "Hy4 preview"
+    python workbuddy_monitor.py --list     # 查看任务队列
+    python workbuddy_monitor.py --status   # 查看限流状态
+"""
+
+import argparse
+import sys as _sys
+if _sys.stdout and hasattr(_sys.stdout, 'reconfigure'):
+    _sys.stdout.reconfigure(encoding='utf-8')
+    _sys.stderr.reconfigure(encoding='utf-8')
+import json
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 路径与配置
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = BASE_DIR / "config.json"
+STATE_FILE = BASE_DIR / "state.json"
+LOG_FILE = BASE_DIR / "monitor.log"
+
+DEFAULT_CONFIG = {
+    # 限流检测：要监控的消息来源（文件路径或 "clipboard"）
+    "watch_file": "",
+    # 自动发送方式: "notify"  = Windows 通知提醒
+    #              "command" = 执行 config.send_command（占位符 {task}）
+    #              "api"     = POST 到 config.api.url
+    "send_mode": "notify",
+    "send_command": "",
+    # 可选的余额/用量查询 API
+    "api": {
+        "url": "",
+        "headers": {},
+        "balance_field": "balance",   # JSON 响应中表示余额的字段
+        "usage_field": "usage",       # JSON 响应中表示用量的字段
+    },
+    # 轮询间隔（秒）
+    "poll_interval": 30,
+    # Windows 通知标题
+    "notify_title": "WorkBuddy 监控",
+}
+
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    else:
+        cfg = DEFAULT_CONFIG.copy()
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    # 补齐缺失键
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"tasks": [], "rate_limits": {}}
+
+
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def log(msg: str):
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# 限流消息解析
+# ---------------------------------------------------------------------------
+# 匹配 "Hy4 preview模型" / "Hy4 preview 模型"
+MODEL_RE = re.compile(r"您在\s*(.+?)\s*模型的使用量已超出频率限制")
+# 匹配 "可在2026-09-09 19:30:24 重置可用" 或 "可在2026-09-09 19:30:24 重置"
+TIME_RE = re.compile(r"可在\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*重置")
+# 备用：只要时间
+TIME_RE2 = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+
+
+def parse_rate_limit_message(text: str):
+    """解析限流消息，返回 (model, reset_time: datetime|None, ok)"""
+    model = None
+    reset = None
+    m = MODEL_RE.search(text)
+    if m:
+        model = m.group(1).strip()
+    t = TIME_RE.search(text)
+    if t:
+        reset = datetime.strptime(t.group(1), "%Y-%m-%d %H:%M:%S")
+    else:
+        t2 = TIME_RE2.search(text)
+        if t2:
+            reset = datetime.strptime(t2.group(1), "%Y-%m-%d %H:%M:%S")
+    return model, reset, (model is not None or reset is not None)
+
+# ---------------------------------------------------------------------------
+# 任务队列
+# ---------------------------------------------------------------------------
+def add_task(state: dict, content: str, model: str = ""):
+    task = {
+        "id": int(time.time() * 1000),
+        "content": content,
+        "model": model,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "pending",  # pending / sent
+    }
+    state["tasks"].append(task)
+    save_state(state)
+    log(f"已添加任务 #{task['id']}: {content[:50]}")
+    return task
+
+
+def pending_tasks(state: dict, model: str = ""):
+    return [t for t in state["tasks"]
+            if t["status"] == "pending" and (not model or t.get("model") == model)]
+
+# ---------------------------------------------------------------------------
+# 发送
+# ---------------------------------------------------------------------------
+def send_windows_notification(title: str, body: str):
+    try:
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$n = New-Object System.Windows.Forms.NotifyIcon; "
+            "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+            "$n.Visible = $true; "
+            f"$n.ShowBalloonTip(5000, '{title}', '{body}', "
+            "[System.Windows.Forms.ToolTipIcon]::Info)"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, timeout=15,
+        )
+    except Exception as e:
+        log(f"通知发送失败: {e}")
+
+
+def send_task(task: dict, cfg: dict):
+    mode = cfg.get("send_mode", "notify")
+    log(f"发送任务 #{task['id']}: {task['content'][:50]} (mode={mode})")
+    if mode == "command":
+        cmd = cfg.get("send_command", "")
+        if cmd:
+            cmd = cmd.replace("{task}", task["content"])
+            subprocess.run(cmd, shell=True, capture_output=True, timeout=60)
+    elif mode == "api":
+        import urllib.request
+        api = cfg.get("api", {})
+        if api.get("url"):
+            data = json.dumps({"task": task["content"], "model": task.get("model", "")}).encode("utf-8")
+            req = urllib.request.Request(api["url"], data=data, method="POST")
+            req.add_header("Content-Type", "application/json")
+            for k, v in api.get("headers", {}).items():
+                req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                log(f"API 响应: {resp.status}")
+    else:
+        send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"),
+                                  f"任务已恢复可发送：{task['content'][:80]}")
+    task["status"] = "sent"
+    state = load_state()
+    for t in state.get("tasks", []):
+        if t["id"] == task["id"]:
+            t["status"] = "sent"
+            break
+    save_state(state)
+    log(f"任务 #{task['id']} 已发送")
+
+# ---------------------------------------------------------------------------
+# 监控主循环
+# ---------------------------------------------------------------------------
+def check_rate_limits(state: dict, cfg: dict):
+    """从监控源读取新消息，更新 state['rate_limits']"""
+    src = cfg.get("watch_file", "")
+    text = ""
+    if src == "clipboard":
+        try:
+            ps = "Get-Clipboard -Raw"
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=10,
+                               encoding="utf-8")
+            text = r.stdout or ""
+        except Exception:
+            return
+    elif src and Path(src).exists():
+        text = Path(src).read_text(encoding="utf-8", errors="ignore")
+    else:
+        return
+
+    model, reset, ok = parse_rate_limit_message(text)
+    if ok:
+        key = model or "default"
+        entry = state["rate_limits"].setdefault(key, {})
+        entry["model"] = model or key
+        if reset:
+            entry["reset"] = reset.strftime("%Y-%m-%d %H:%M:%S")
+        entry["raw"] = text.strip()[:300]
+        save_state(state)
+        log(f"检测到限流: model={model} reset={reset}")
+
+
+def balance_check(cfg: dict):
+    """查询可选的余额 API，返回 (balance, usage) 或 (None, None)"""
+    api = cfg.get("api", {})
+    if not api.get("url"):
+        return None, None
+    try:
+        import urllib.request
+        req = urllib.request.Request(api["url"], method="GET")
+        for k, v in api.get("headers", {}).items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        bal = data.get(api.get("balance_field", "balance"))
+        usage = data.get(api.get("usage_field", "usage"))
+        return bal, usage
+    except Exception as e:
+        log(f"余额查询失败: {e}")
+        return None, None
+
+
+def run_loop(cfg: dict, once: bool = False):
+    state = load_state()
+    interval = max(5, int(cfg.get("poll_interval", 30)))
+    log(f"开始监控 (interval={interval}s, mode={cfg.get('send_mode')})")
+    while True:
+        check_rate_limits(state, cfg)
+
+        now = datetime.now()
+        # 检查限流模型的重置时间，到点则发送该模型的待发任务
+        rl = state.get("rate_limits", {})
+        if not isinstance(rl, dict):
+            rl = {}
+            state["rate_limits"] = {}
+        for key, info in list(rl.items()):
+            reset_str = info.get("reset", "")
+            if not reset_str:
+                continue
+            reset = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+            if now >= reset:
+                model = info.get("model", key)
+                tasks = pending_tasks(state, model=model)
+                if not tasks:
+                    tasks = pending_tasks(state)  # 无指定模型则发全部
+                for t in tasks:
+                    send_task(t, cfg)
+                if tasks:
+                    # 发完即清除限流记录
+                    state["rate_limits"].pop(key, None)
+                    save_state(state)
+
+        # 查询余额（可选）
+        bal, usage = balance_check(cfg)
+        if bal is not None:
+            log(f"余额={bal} 用量={usage}")
+
+        if once:
+            break
+        time.sleep(interval)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(description="WorkBuddy 用量/余额监控")
+    p.add_argument("--add", metavar="TEXT", help="添加任务")
+    p.add_argument("--model", default="", help="任务关联的模型（可选）")
+    p.add_argument("--list", action="store_true", help="列出任务")
+    p.add_argument("--status", action="store_true", help="查看限流状态")
+    p.add_argument("--clear", action="store_true", help="清空已发送任务")
+    p.add_argument("--parse", metavar="TEXT", help="解析一条限流消息（测试）")
+    p.add_argument("--once", action="store_true", help="单次检查后退出")
+    args = p.parse_args()
+
+    cfg = load_config()
+
+    if args.parse is not None:
+        model, reset, ok = parse_rate_limit_message(args.parse)
+        print(f"解析成功: {ok}\n模型: {model}\n重置时间: {reset}")
+        return
+
+    if args.add:
+        state = load_state()
+        add_task(state, args.add, args.model)
+        return
+
+    if args.list:
+        state = load_state()
+        tasks = state.get("tasks", [])
+        if not tasks:
+            print("(队列为空)")
+        for t in tasks:
+            mark = "[done]" if t["status"] == "sent" else "[wait]"
+            print(f"{mark} #{t['id']} [{t['status']}] model={t.get('model','-')} {t['content']}")
+        return
+
+    if args.status:
+        state = load_state()
+        rl = state.get("rate_limits", {})
+        if not rl:
+            print("(无限流记录)")
+        if not isinstance(rl, dict):
+            rl = {}
+        for k, v in rl.items():
+            print(f"{k}: model={v.get('model')} reset={v.get('reset')}")
+        return
+
+    if args.clear:
+        state = load_state()
+        state["tasks"] = [t for t in state.get("tasks", []) if t["status"] != "sent"]
+        save_state(state)
+        print("已清理已发送任务")
+        return
+
+    run_loop(cfg, once=args.once)
+
+
+if __name__ == "__main__":
+    main()
