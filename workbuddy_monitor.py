@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
     #              "api"     = POST 到 config.api.url
     "send_mode": "notify",
     "send_command": "",
+    # 用官方 API（CDP 句柄）读取精确积分余额，默认启用
+    "api_balance": True,
     # 可选的余额/用量查询 API
     "api": {
         "url": "",
@@ -389,6 +391,18 @@ def send_task(task: dict, cfg: dict):
                 if balance_before is not None:
                     log(f"发送前余额基线: {balance_before}")
             attempts = int(task.get("attempts", 0))
+            # 发送前通过 CDP 选择任务指定的模型（句柄/API 方式，等价人工点击）
+            want_model = (task.get("model") or "").strip()
+            if want_model:
+                try:
+                    import workbuddy_cdp
+                    ok_m, why_m = workbuddy_cdp.select_model(want_model)
+                    if ok_m:
+                        log(f"已切换模型到 {want_model}")
+                    else:
+                        log(f"模型切换失败({why_m})，按当前模型发送")
+                except Exception as e:
+                    log(f"模型切换异常: {e}")
             ok, msg = auto_send_to_workbuddy(task["content"],
                                              auto.get("window_title", "WorkBuddy"))
             log(f"自动发送结果(第{attempts+1}次): {msg}")
@@ -509,8 +523,16 @@ def read_balance_clipboard():
 
 
 def read_balance(cfg: dict):
-    """统一余额入口：优先 HTTP API，未配置 API 时回退剪贴板解析。
-    返回 float 或 None"""
+    """统一余额入口：优先 WorkBuddy 官方 API（CDP 取 token），
+    未配置/失败时回退 HTTP API 与剪贴板解析。返回 float 或 None"""
+    if cfg.get("api_balance", True):
+        try:
+            import workbuddy_cdp
+            info = workbuddy_cdp.read_credits()
+            if info and info.get("left") is not None:
+                return float(info["left"])
+        except Exception:
+            pass
     bal, _ = balance_check(cfg)
     if bal is not None:
         return bal

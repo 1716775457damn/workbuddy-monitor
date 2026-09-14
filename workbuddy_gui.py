@@ -357,16 +357,39 @@ class App:
         self.refresh_limit()
 
     def on_balance(self):
+        # 优先走 WorkBuddy 官方 API（CDP token），带套餐明细
+        try:
+            import workbuddy_cdp
+            info = workbuddy_cdp.read_credits()
+        except Exception:
+            info = None
+        if info:
+            lines = [f"剩余积分: {info['left']} / {info['total']}",
+                     f"已用: {info['used']}    用户类型: {'付费' if info['is_paid'] else '免费'}",
+                     ""]
+            for p in info.get("packages", []):
+                lines.append(f"· {p['code'][:24]}…  {p['remain']} / {p['total']} {p['unit']}")
+            try:
+                cur = workbuddy_cdp.current_model()
+                if cur:
+                    lines.append("")
+                    lines.append(f"当前模型: {cur}")
+            except Exception:
+                pass
+            messagebox.showinfo("余额查询（官方 API）", "\n".join(lines))
+            return
         bal, usage = core.balance_check(self.cfg)
         if bal is None:
-            messagebox.showinfo("余额查询", "未配置余额 API，请编辑 config.json 填写 api.url")
+            messagebox.showinfo("余额查询",
+                "无法通过官方 API 读取（WorkBuddy 未运行或 token 失效）。\n\n"
+                "请先启动 WorkBuddy（带 CDP 参数），或编辑 config.json 填写 api.url")
         else:
             messagebox.showinfo("余额查询", f"余额: {bal}\n用量: {usage}")
 
     def on_settings(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("设置")
-        dlg.geometry("460x270")
+        dlg.geometry("520x300")
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.columnconfigure(0, weight=1)
@@ -386,6 +409,9 @@ class App:
                         variable=v3).grid(row=2, column=0, sticky="w", padx=14, pady=4)
         ttk.Checkbutton(dlg, text="只在免费时段自动发送（23:00-次日 08:00，不消耗积分）",
                         variable=v4).grid(row=3, column=0, sticky="w", padx=14, pady=4)
+        v5 = tk.BooleanVar(value=self.cfg.get("api_balance", True))
+        ttk.Checkbutton(dlg, text="用官方 API 读取精确积分余额（通过 WorkBuddy 句柄，默认启用）",
+                        variable=v5).grid(row=4, column=0, sticky="w", padx=14, pady=4)
 
         # 守卫暂停状态 + 恢复按钮
         gs = ttk.LabelFrame(dlg, text="余额守卫状态")
@@ -407,6 +433,7 @@ class App:
             self.cfg.setdefault("auto_send", {}).update({
                 "enabled": v1.get(), "free_only": v2.get(), "balance_guard": v3.get(),
                 "free_window": {"enabled": v4.get(), "start": "23:00", "end": "08:00"}})
+            self.cfg["api_balance"] = v5.get()
             core.save_config(self.cfg)
             dlg.destroy()
 
