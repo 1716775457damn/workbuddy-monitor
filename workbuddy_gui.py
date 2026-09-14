@@ -210,8 +210,13 @@ class App:
             self.refresh_all()
             if core.balance_guard_paused(self.state):
                 self.lbl_guard.config(text="⛔ 余额守卫：自动发送已暂停", foreground="red")
+            elif not core.in_free_window(self.cfg):
+                nxt = core.next_free_window(self.cfg)
+                nxt_s = nxt.strftime("%H:%M") if nxt else "23:00"
+                self.lbl_guard.config(text=f" 推动🕘 等待免费时段 23:00-08:00（{nxt_s} 后开始）".replace("推动", ""),
+                                      foreground="#B8860B")
             else:
-                self.lbl_guard.config(text="", foreground="black")
+                self.lbl_guard.config(text="🟢 免费时段中", foreground="green")
         except Exception:
             pass
         self.root.after(2000, self._auto_sync)
@@ -361,15 +366,17 @@ class App:
     def on_settings(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("设置")
-        dlg.geometry("420x240")
+        dlg.geometry("460x270")
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.columnconfigure(0, weight=1)
 
         auto = self.cfg.get("auto_send", {})
+        fw = auto.get("free_window", {})
         v1 = tk.BooleanVar(value=auto.get("enabled", True))
         v2 = tk.BooleanVar(value=auto.get("free_only", True))
         v3 = tk.BooleanVar(value=auto.get("balance_guard", True))
+        v4 = tk.BooleanVar(value=fw.get("enabled", True))
 
         ttk.Checkbutton(dlg, text="到点自动发送到 WorkBuddy 窗口",
                         variable=v1).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 4))
@@ -377,6 +384,8 @@ class App:
                         variable=v2).grid(row=1, column=0, sticky="w", padx=14, pady=4)
         ttk.Checkbutton(dlg, text="积分余额守卫（发送后余额减少立即停止+弹窗报警）",
                         variable=v3).grid(row=2, column=0, sticky="w", padx=14, pady=4)
+        ttk.Checkbutton(dlg, text="只在免费时段自动发送（23:00-次日 08:00，不消耗积分）",
+                        variable=v4).grid(row=3, column=0, sticky="w", padx=14, pady=4)
 
         # 守卫暂停状态 + 恢复按钮
         gs = ttk.LabelFrame(dlg, text="余额守卫状态")
@@ -396,7 +405,8 @@ class App:
 
         def save():
             self.cfg.setdefault("auto_send", {}).update({
-                "enabled": v1.get(), "free_only": v2.get(), "balance_guard": v3.get()})
+                "enabled": v1.get(), "free_only": v2.get(), "balance_guard": v3.get(),
+                "free_window": {"enabled": v4.get(), "start": "23:00", "end": "08:00"}})
             core.save_config(self.cfg)
             dlg.destroy()
 
@@ -438,6 +448,10 @@ class App:
                     self._mon_stop.wait(interval)
                     continue
                 core.check_rate_limits(state, self.cfg)
+                # 免费时段外：只监控限流消息，不触发自动发送
+                if not core.in_free_window(self.cfg):
+                    self._mon_stop.wait(interval)
+                    continue
                 now = datetime.now()
                 rl = state.get("rate_limits", {})
                 if isinstance(rl, dict):

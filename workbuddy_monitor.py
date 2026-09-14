@@ -66,6 +66,11 @@ DEFAULT_CONFIG = {
         "window_title": "WorkBuddy",
         "free_only": True,  # 只在限流重置后(免费额度)自动发送，绝不走积分通道
         "balance_guard": True,  # 积分余额守卫：发送后余额减少立即停止并报警
+        "free_window": {  # 免费时段：只在此时段内自动发送（不消耗积分）
+            "enabled": True,
+            "start": "23:00",
+            "end": "08:00",
+        },
     },
 }
 
@@ -373,6 +378,10 @@ def send_task(task: dict, cfg: dict):
     else:
         auto = cfg.get("auto_send", {})
         if auto.get("enabled") and auto.get("free_only", True):
+            # 免费时段检查：不在 23:00-08:00 内不发送，任务保留排队
+            if not in_free_window(cfg):
+                log(f"任务 #{task['id']} 等待免费时段(23:00-08:00)，暂不发送")
+                return
             # 余额守卫：发送前读余额作为基线
             balance_before = None
             if auto.get("balance_guard", True):
@@ -509,6 +518,41 @@ def read_balance(cfg: dict):
 
 
 _BALANCE_STATE_KEY = "balance_guard"
+
+
+def in_free_window(cfg: dict, now=None) -> bool:
+    """判断当前时间是否在免费时段内（支持跨午夜，如 23:00-08:00）。
+    未配置时默认启用 23:00-08:00。"""
+    w = cfg.get("auto_send", {}).get("free_window", {})
+    if w.get("enabled", True) is False:
+        return True  # 用户明确关闭了时段限制
+    try:
+        sh, sm = map(int, str(w.get("start", "23:00")).split(":"))
+        eh, em = map(int, str(w.get("end", "08:00")).split(":"))
+    except (ValueError, AttributeError):
+        return True
+    now = now or datetime.now()
+    cur = now.hour * 60 + now.minute
+    s, e = sh * 60 + sm, eh * 60 + em
+    if s == e:
+        return True  # 全天
+    if s < e:
+        return s <= cur < e
+    return cur >= s or cur < e  # 跨午夜窗口
+
+
+def next_free_window(cfg: dict, now=None):
+    """返回下一个免费时段开始的 datetime（用于倒计时显示）"""
+    w = cfg.get("auto_send", {}).get("free_window", {})
+    try:
+        sh, sm = map(int, str(w.get("start", "23:00")).split(":"))
+    except (ValueError, AttributeError):
+        return None
+    now = now or datetime.now()
+    start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    if now >= start:
+        start += timedelta(days=1)
+    return start
 
 
 def balance_guard_paused(state: dict) -> bool:
